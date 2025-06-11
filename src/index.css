@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply antialiased text-slate-800;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply px-6 py-3 bg-gradient-to-br from-teal-500 via-teal-600 to-teal-700 text-white rounded-xl
+    shadow-lg shadow-teal-500/20 hover:shadow-teal-500/30 hover:-translate-y-0.5 
+    active:translate-y-0 transition-all duration-200 disabled:opacity-50 
+    disabled:hover:translate-y-0 disabled:cursor-not-allowed font-semibold
+    hover:bg-gradient-to-br hover:from-teal-400 hover:via-teal-500 hover:to-teal-600
+    focus:ring-4 focus:ring-teal-500/20 outline-none;
+  }
+  
+  .btn-secondary {
+    @apply px-6 py-3 bg-white border-2 border-slate-200 text-slate-700 rounded-xl
+    shadow-sm hover:bg-slate-50 hover:border-slate-300 transition-all duration-200
+    active:bg-slate-100 font-semibold hover:-translate-y-0.5 active:translate-y-0
+    focus:ring-4 focus:ring-slate-500/20 outline-none;
+  }
+
+  .card {
+    @apply bg-white rounded-3xl shadow-xl shadow-slate-200/50 border border-slate-100
+    backdrop-blur-xl backdrop-saturate-150 bg-white/90;
+  }
+
+  .input-field {
+    @apply block w-full px-4 py-3 rounded-xl border-2 border-slate-200 
+    focus:ring-4 focus:ring-teal-500/20 focus:border-teal-500 
+    transition-all duration-200 font-medium;
+  }
+
+  .glass-effect {
+    @apply backdrop-blur-xl backdrop-saturate-150 bg-white/90;
+  }
+}
+
+.animate-float {
+  animation: float 6s ease-in-out infinite;
+}
+
+.animate-pulse-slow {
+  animation: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+.animate-gradient {
+  background-size: 200% 200%;
+  animation: gradient 8s ease infinite;
+}
+
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0px) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-20px) rotate(2deg);
+  }
+}
+
+@keyframes gradient {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.scale-102 {
+  transform: scale(1.02);
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-slate-100 rounded-full;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-slate-300 rounded-full hover:bg-slate-400 transition-colors;
+}
+
+/* Smooth scroll behavior */
+html {
+  scroll-behavior: smooth;
+}
