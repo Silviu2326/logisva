@@ -117,7 +117,7 @@ function App() {
                             {result.fileName}
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-900">
-                            {result.items.length}
+                            {result.checklistNumber || 'No extraído'}
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap">
                             <span className="px-4 py-1.5 text-sm font-semibold rounded-full bg-teal-100 text-teal-800">

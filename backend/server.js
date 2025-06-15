@@ -7,8 +7,9 @@ import sharp from 'sharp';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fs from 'fs';
-import cv from 'opencv.js'; // al principio del archivo
+import cv from 'opencv.js';
 import OpenAI from 'openai';
+import { Mistral } from '@mistralai/mistralai'; // Nueva importación
 
 // REMOVE cvReady related code
 // // Promesa para asegurar que OpenCV.js está listo
@@ -230,6 +231,17 @@ async function deskew(buffer) {
 async function processImage(imageBuffer, filename) {
   try {
     console.log(`Iniciando procesamiento de ${filename}`);
+    
+    // Primero intentar con Mistral OCR
+    console.log(`Intentando extracción con Mistral OCR para ${filename}`);
+    const mistralResult = await processImageWithMistral(imageBuffer, filename);
+    if (mistralResult) {
+      console.log(`Mistral logró extraer el número de checklist para ${filename}: ${mistralResult.checklistNumber}`);
+      return mistralResult;
+    }
+    
+    // Si Mistral falla, usar el método tradicional como fallback
+    console.log(`Mistral falló, intentando con métodos tradicionales para ${filename}`);
     let bufferToProcess = await deskew(imageBuffer);
     
     // --- Inicio: Lógica de recorte inteligente --- 
@@ -450,14 +462,18 @@ app.post('/api/process-images', upload.array('images', 10), async (req, res) => 
     // Filtrar resultados exitosos
     const successfulResults = results.filter(result => result.success);
     const failedResults = results.filter(result => !result.success);
+    const mistralResults = successfulResults.filter(result => result.processingMethod === 'mistral_ocr');
     const openaiResults = successfulResults.filter(result => result.processingMethod === 'openai_vision');
-    const traditionalResults = successfulResults.filter(result => result.processingMethod !== 'openai_vision');
-
+    const traditionalResults = successfulResults.filter(result => 
+      result.processingMethod !== 'mistral_ocr' && result.processingMethod !== 'openai_vision'
+    );
+    
     res.json({
       message: 'Procesamiento completado',
       totalImages: req.files.length,
       successfulExtractions: successfulResults.length,
       failedExtractions: failedResults.length,
+      mistralOcrSuccess: mistralResults.length,
       traditionalOcrSuccess: traditionalResults.length,
       openaiSuccess: openaiResults.length,
       results: results,
@@ -592,3 +608,71 @@ function validateAndCorrectChecklistNumber(number) {
       return number; 
   }
 }
+
+// Función para procesar imagen con Mistral OCR (CORREGIDA)
+// Función para procesar imagen con Mistral OCR (ACTUALIZADA)
+async function processImageWithMistral(imageBuffer, filename) {
+  try {
+    console.log(`Intentando extraer número de checklist con Mistral OCR para ${filename}`);
+
+    // Convertir buffer a base64
+    const base64Image = imageBuffer.toString('base64');
+
+    const response = await mistral.chat.complete({
+      model: "pixtral-12b-latest",          // o "pixtral-12b-2409"
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "Analiza esta imagen y extrae únicamente el número de checklist. " +
+                "Busca texto que contenga 'Checklist N°', 'Checklist Nº', 'Checklist N', " +
+                "o variaciones similares, seguido de un número de 5-7 dígitos. " +
+                "Responde SOLO con el número encontrado, sin texto adicional. " +
+                "Si no encuentras un número de checklist válido, responde 'NO_ENCONTRADO'."
+            },
+            {
+              type: "image_url",
+              imageUrl: `data:image/jpeg;base64,${base64Image}`  // <- camelCase
+            }
+          ]
+        }
+      ],
+      max_tokens: 50
+    });
+
+    const extractedText = response.choices?.[0]?.message?.content?.trim();
+    console.log(`Respuesta de Mistral para ${filename}: ${extractedText}`);
+
+    if (extractedText && extractedText !== "NO_ENCONTRADO") {
+      const cleanNumber = extractedText.replace(/[^0-9]/g, "");
+      if (cleanNumber.length >= 5 && cleanNumber.length <= 7) {
+        const fixedNumber = fix(cleanNumber);      // usa tu función fix()
+        console.log(`Mistral extrajo número de checklist: ${fixedNumber} para ${filename}`);
+        return {
+          filename,
+          checklistNumber: fixedNumber,
+          extractedText,
+          confidence: 90,
+          processingMethod: "mistral_ocr",
+          wasCropped: false,
+          cropRegion: null,
+          success: true
+        };
+      }
+    }
+
+    console.log(`Mistral no pudo extraer un número válido de checklist para ${filename}`);
+    return null;
+  } catch (error) {
+    console.error(`Error procesando ${filename} con Mistral:`, error.message);
+    return null;
+  }
+}
+
+// Configurar Mistral
+const mistral = new Mistral({
+  apiKey: process.env.MISTRAL_API_KEY,
+});
