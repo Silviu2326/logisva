@@ -15,7 +15,8 @@ function App() {
     uploadImages,
     processImages,
     clearImages,
-    exportResults
+    exportResults,
+    exportImagesAsZip
   } = useImageProcessor();
 
   return (
@@ -88,12 +89,20 @@ function App() {
                       {results.length} archivos procesados exitosamente
                     </p>
                   </div>
-                  <button 
-                    onClick={exportResults}
-                    className="btn-primary"
-                  >
-                    Exportar resultados
-                  </button>
+                  <div className="flex gap-3">
+                    <button 
+                      onClick={exportResults}
+                      className="btn-primary"
+                    >
+                      Exportar resultados
+                    </button>
+                    <button 
+                      onClick={exportImagesAsZip}
+                      className="btn-secondary"
+                    >
+                      Exportar ZIP con imágenes
+                    </button>
+                  </div>
                 </div>
                 <div className="overflow-auto max-h-96 rounded-2xl border border-slate-200">
                   <table className="min-w-full divide-y divide-slate-200">

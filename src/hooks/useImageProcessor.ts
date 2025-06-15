@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { ProcessingResult, BackendResponse } from '../types';
+import JSZip from 'jszip';
 
 export function useImageProcessor() {
   const [images, setImages] = useState<File[]>([]);
@@ -130,6 +131,48 @@ export function useImageProcessor() {
     URL.revokeObjectURL(url);
   };
 
+  const exportImagesAsZip = async () => {
+    if (results.length === 0 || images.length === 0) return;
+    
+    const zip = new JSZip();
+    
+    // Filtrar solo los resultados exitosos que tienen número de checklist
+    const successfulResults = results.filter(r => r.success && r.checklistNumber);
+    
+    if (successfulResults.length === 0) {
+      alert('No hay imágenes con números de checklist extraídos para exportar.');
+      return;
+    }
+    
+    // Agregar cada imagen al ZIP con el nombre del checklist
+    for (const result of successfulResults) {
+      const originalImage = images.find(img => img.name === result.fileName);
+      if (originalImage) {
+        const fileExtension = originalImage.name.split('.').pop() || 'jpg';
+        const newFileName = `${result.checklistNumber}.${fileExtension}`;
+        zip.file(newFileName, originalImage);
+      }
+    }
+    
+    try {
+      // Generar el ZIP
+      const content = await zip.generateAsync({ type: 'blob' });
+      
+      // Crear enlace de descarga
+      const url = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `checklist-images-${new Date().toISOString().split('T')[0]}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Error creando ZIP:', error);
+      alert('Error al crear el archivo ZIP');
+    }
+  };
+
   return {
     images,
     isProcessing,
@@ -138,6 +181,7 @@ export function useImageProcessor() {
     uploadImages,
     processImages,
     clearImages,
-    exportResults
+    exportResults,
+    exportImagesAsZip
   };
 }
