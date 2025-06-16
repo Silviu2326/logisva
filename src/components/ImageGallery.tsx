@@ -43,25 +43,50 @@ const ImageGallery: React.FC<ImageGalleryProps> = ({ images, results }) => {
               />
               
               {hasResults && (
-                <div className="absolute top-3 right-3 bg-teal-500 text-white rounded-full p-2 shadow-lg z-20 animate-pulse-slow">
-                  <Check size={16} />
-                </div>
+                <>
+                  <div className="absolute top-3 right-3 bg-teal-500 text-white rounded-full p-2 shadow-lg z-20 animate-pulse-slow">
+                    <Check size={16} />
+                  </div>
+                  {resultMap[image.name].retryAttempt && resultMap[image.name].retryAttempt > 1 && (
+                    <div className="absolute top-3 left-3 bg-orange-500 text-white rounded-full px-2 py-1 text-xs font-bold shadow-lg z-20">
+                      #{resultMap[image.name].retryAttempt}
+                    </div>
+                  )}
+                </>
               )}
               
-              <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/30 to-transparent opacity-0 group-hover:opacity-100 transition-all duration-500 flex items-end p-4 z-20">
-                <div className="w-full flex items-end justify-between gap-4">
-                  <span className="text-white text-sm font-medium truncate flex-1">
+              <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/30 to-transparent opacity-0 group-hover:opacity-100 transition-all duration-500 flex flex-col justify-end p-4 z-20">
+                <div className="w-full space-y-2">
+                  <span className="text-white text-sm font-medium truncate block">
                     {image.name}
                   </span>
-                  <button 
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleImageClick(imageUrl);
-                    }}
-                    className="p-2 bg-white/10 hover:bg-white/20 rounded-xl backdrop-blur-sm transition-colors group/btn"
-                  >
-                    <Maximize2 size={18} className="text-white transform group-hover/btn:scale-110 transition-transform" />
-                  </button>
+                  {hasResults && (
+                    <div className="text-xs text-white/80 space-y-1">
+                      {resultMap[image.name].checklistNumber && (
+                        <div>Checklist: <span className="font-semibold text-teal-300">{resultMap[image.name].checklistNumber}</span></div>
+                      )}
+                      {resultMap[image.name].retryAttempt && (
+                        <div>Intento: <span className="font-semibold text-orange-300">#{resultMap[image.name].retryAttempt}</span></div>
+                      )}
+                      {resultMap[image.name].processingConfig && (
+                        <div>Config: <span className="font-semibold text-blue-300">{resultMap[image.name].processingConfig}</span></div>
+                      )}
+                      {resultMap[image.name].confidence && (
+                        <div>Confianza: <span className="font-semibold text-green-300">{resultMap[image.name].confidence}%</span></div>
+                      )}
+                    </div>
+                  )}
+                  <div className="flex justify-end">
+                    <button 
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleImageClick(imageUrl);
+                      }}
+                      className="p-2 bg-white/10 hover:bg-white/20 rounded-xl backdrop-blur-sm transition-colors group/btn"
+                    >
+                      <Maximize2 size={18} className="text-white transform group-hover/btn:scale-110 transition-transform" />
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

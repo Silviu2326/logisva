@@ -17,6 +17,9 @@ export interface ProcessingResult {
     width: number;
     height: number;
   } | null;
+  retryAttempt?: number;
+  processingConfig?: string;
+  rotation?: number;
   success: boolean;
   error?: string;
   timestamp: string;
@@ -34,5 +37,10 @@ export interface BackendResponse {
     filename: string;
     checklistNumber: string;
     method: string;
+    retryAttempt: number;
+    processingConfig: string;
+    wasCropped: boolean;
+    rotation: number;
+    confidence: number;
   }[];
 }

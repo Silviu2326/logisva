@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ProcessingResult, BackendResponse } from '../types';
 import JSZip from 'jszip';
 
+
 export function useImageProcessor() {
   const [images, setImages] = useState<File[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -27,18 +28,25 @@ export function useImageProcessor() {
     try {
       // Crear FormData para enviar las imágenes
       const formData = new FormData();
-      images.forEach((image) => {
+      images.forEach((image, index) => {
+        console.log(`Adding image ${index}: ${image.name}, type: ${image.type}`);
         formData.append('images', image);
       });
+      
+      // Log FormData contents for debugging
+      console.log('FormData entries:');
+      for (let pair of formData.entries()) {
+        console.log(pair[0], pair[1]);
+      }
       
       // Simular progreso mientras se envía
       setProgress(25);
       
-      // Enviar al backend
-      const response = await fetch('https://logisvaa-fa905005c15b.herokuapp.com/api/process-images', {
+      // Enviar al backend - DO NOT set Content-Type header
+      const response = await fetch('http://localhost:3001/api/process-images', {
         method: 'POST',
         body: formData,
-      });
+          });
       
       setProgress(50);
       
@@ -59,6 +67,9 @@ export function useImageProcessor() {
         processingMethod: result.processingMethod,
         wasCropped: result.wasCropped,
         cropRegion: result.cropRegion,
+        retryAttempt: result.retryAttempt,
+        processingConfig: result.processingConfig,
+        rotation: result.rotation,
         success: result.success,
         error: result.error,
         timestamp: new Date().toISOString(),
@@ -113,6 +124,10 @@ export function useImageProcessor() {
           checklistNumber: r.checklistNumber,
           processingMethod: r.processingMethod,
           confidence: r.confidence,
+          retryAttempt: r.retryAttempt,
+          processingConfig: r.processingConfig,
+          wasCropped: r.wasCropped,
+          rotation: r.rotation,
         })),
       detailedResults: results,
     };
@@ -173,6 +188,38 @@ export function useImageProcessor() {
     }
   };
 
+  const saveManualEntry = (fileName: string, checklistNumber: string) => {
+    setResults(prevResults => 
+      prevResults.map(result => 
+        result.fileName === fileName 
+          ? {
+              ...result,
+              success: true,
+              checklistNumber,
+              processingMethod: 'manual_entry',
+              confidence: 100,
+              error: undefined
+            }
+          : result
+      )
+    );
+  };
+
+  const updateChecklistNumber = (fileName: string, checklistNumber: string) => {
+    setResults(prevResults => 
+      prevResults.map(result => 
+        result.fileName === fileName 
+          ? {
+              ...result,
+              checklistNumber,
+              success: true,
+              error: undefined
+            }
+          : result
+      )
+    );
+  };
+
   return {
     images,
     isProcessing,
@@ -182,6 +229,8 @@ export function useImageProcessor() {
     processImages,
     clearImages,
     exportResults,
-    exportImagesAsZip
+    exportImagesAsZip,
+    saveManualEntry,
+    updateChecklistNumber
   };
 }

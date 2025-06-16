@@ -40,9 +40,26 @@ const storage = multer.memoryStorage();
 const upload = multer({ 
   storage: storage,
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB límite
+    fileSize: 500 * 1024 * 1024, // 500MB límite
   },
   fileFilter: (req, file, cb) => {
+    console.log(`Archivo recibido: ${file.originalname}, campo: ${file.fieldname}, tipo: ${file.mimetype}`);
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Solo se permiten archivos de imagen'), false);
+    }
+  }
+});
+
+// Configuración alternativa de multer que acepta cualquier campo
+const uploadAny = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 500 * 1024 * 1024, // 500MB límite
+  },
+  fileFilter: (req, file, cb) => {
+    console.log(`Archivo recibido (any): ${file.originalname}, campo: ${file.fieldname}, tipo: ${file.mimetype}`);
     if (file.mimetype.startsWith('image/')) {
       cb(null, true);
     } else {
@@ -232,7 +249,7 @@ async function processImage(imageBuffer, filename) {
   try {
     console.log(`Iniciando procesamiento de ${filename}`);
     
-    // Primero intentar con Mistral OCR
+    // Solo usar Mistral OCR (sin fallback a métodos tradicionales)
     console.log(`Intentando extracción con Mistral OCR para ${filename}`);
     const mistralResult = await processImageWithMistral(imageBuffer, filename);
     if (mistralResult) {
@@ -240,174 +257,19 @@ async function processImage(imageBuffer, filename) {
       return mistralResult;
     }
     
-    // Si Mistral falla, usar el método tradicional como fallback
-    console.log(`Mistral falló, intentando con métodos tradicionales para ${filename}`);
-    let bufferToProcess = await deskew(imageBuffer);
+    // Si Mistral falla, devolver error directamente (sin procesamiento tradicional)
+    console.log(`Mistral no pudo extraer número de checklist para ${filename}`);
+    return {
+      filename,
+      checklistNumber: null,
+      error: 'No se pudo extraer número de checklist con Mistral OCR.',
+      extractedText: '',
+      wasCropped: false,
+      cropRegion: null,
+      success: false
+    };
     
-    // --- Inicio: Lógica de recorte inteligente --- 
-    // let bufferToProcess = imageBuffer; // Original line, now deskewed buffer is used
-    let cropRegion = null;
-    try {
-      // Primero, un OCR rápido sobre una versión reducida para encontrar la zona de "Checklist"
-      const preliminaryOcrImage = await sharp(imageBuffer)
-        .resize({ width: 1500, fit: 'inside', withoutEnlargement: true })
-        .greyscale()
-        .normalize()
-        .toBuffer();
 
-      const { data: { text: preliminaryText } } = await Tesseract.recognize(preliminaryOcrImage, 'spa', {
-        tessedit_pageseg_mode: Tesseract.PSM.AUTO_OSD,
-      });
-      
-      console.log(`Texto preliminar para recorte (primeros 300 chars): ${preliminaryText.substring(0,300)}`);
-
-      const keywords = ['checklist n', 'checklistn', 'check list n', 'checklista', 'checklist nº', 'checklist n°'];
-      let keywordYPosition = -1;
-      let keywordXPosition = -1;
-      const lines = preliminaryText.split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].toLowerCase();
-        for (const keyword of keywords) {
-          const xIndex = line.indexOf(keyword);
-          if (xIndex !== -1) {
-            keywordYPosition = i; // Aproximación de la línea
-            keywordXPosition = xIndex; // Aproximación de la columna
-            console.log(`Palabra clave '${keyword}' encontrada en línea ${i}, posición ~${xIndex}`);
-            break;
-          }
-        }
-        if (keywordYPosition !== -1) break;
-      }
-
-      if (keywordYPosition !== -1) {
-        const { width, height } = await sharp(imageBuffer).metadata();
-        const estimatedLineHeight = height / lines.length; // Altura estimada por línea
-        
-        // Definir la región de recorte (ROI - Region Of Interest)
-        // Queremos un área alrededor y debajo de la palabra clave
-        const roiTop = Math.max(0, Math.floor(keywordYPosition * estimatedLineHeight - estimatedLineHeight * 0.5)); // Un poco antes de la línea
-        const roiHeight = Math.min(height - roiTop, Math.floor(estimatedLineHeight * 3)); // Unas 3 líneas de altura
-        const roiLeft = Math.max(0, Math.floor(keywordXPosition * (width / (lines[keywordYPosition]?.length || width)) - (width * 0.1) )); // Un poco antes de la palabra clave
-        const roiWidth = Math.min(width - roiLeft, Math.floor(width * 0.8)); // Ancho considerable desde la palabra clave
-
-        if (roiWidth > 0 && roiHeight > 0 && roiTop < height && roiLeft < width) {
-            cropRegion = { left: roiLeft, top: roiTop, width: roiWidth, height: roiHeight };
-            console.log('Región de recorte calculada:', cropRegion);
-            bufferToProcess = await sharp(imageBuffer).extract(cropRegion).toBuffer();
-            // fs.writeFileSync(join(__dirname, `cropped_${filename}`), bufferToProcess); // Para depuración
-            console.log('Imagen recortada para procesamiento detallado.');
-        } else {
-            console.log('No se pudo calcular una región de recorte válida. Usando imagen completa.');
-            cropRegion = null;
-        }
-      } else {
-        console.log('No se encontró la palabra clave "Checklist" para el recorte. Usando imagen completa.');
-      }
-    } catch (e) {
-      console.error('Error durante el intento de recorte inteligente:', e.message);
-      // Si falla el recorte, continuamos con la imagen completa
-      bufferToProcess = imageBuffer;
-      cropRegion = null;
-    }
-    // --- Fin: Lógica de recorte inteligente ---
-
-    const rotations = [0, 90, 180, 270];
-    const processingOptions = rotations.flatMap(angle => ([
-      {
-        name: `soft_rot${angle}`,
-        appliesToCropped: false,
-        process: buf => sharp(buf).rotate(angle).greyscale().normalize().sharpen().toBuffer()
-      },
-      {
-        name: `cropped_soft_rot${angle}`,
-        appliesToCropped: true,
-        process: buf => sharp(buf).rotate(angle).resize({width:2200,height:900,fit:'contain'}).greyscale().normalize().sharpen().toBuffer()
-      }
-    ]));
-
-    let bestResult = null;
-    let bestConfidence = -1;
-    let bestTextForDebug = '';
-
-    for (const option of processingOptions) {
-      // Aplicar opción solo si es para imagen recortada y tenemos una, o si es para imagen completa
-      if ((option.appliesToCropped && cropRegion) || (!option.appliesToCropped && !cropRegion)) {
-        try {
-          console.log(`Probando procesamiento: ${option.name}`);
-          // Usar bufferToProcess (que puede ser la imagen original o la recortada)
-          const processedImage = await option.process(bufferToProcess);
-          // fs.writeFileSync(join(__dirname, `processed_${option.name}_${filename}`), processedImage); // Para depuración
-
-          const { data: { text, confidence } } = await Tesseract.recognize(
-            processedImage,
-            'spa+eng',
-            {
-              tessedit_pageseg_mode: 6, // Changed from: option.name.startsWith('cropped') ? 7 : 6,
-              // tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzº°#:.- ', // Removed whitelist
-              tessedit_ocr_engine_mode: Tesseract.OEM.LSTM_ONLY
-            }
-          );
-          
-          console.log(`${option.name} - Confianza OCR: ${confidence}%`);
-          console.log(`${option.name} - Texto OCR (primeros 100): ${text.substring(0, 100)}...`);
-
-          const checklistNumber = extractChecklistNumber(text);
-          
-          if (checklistNumber) {
-            if (!bestResult || confidence > bestConfidence) {
-              bestResult = {
-                filename,
-                checklistNumber,
-                extractedText: text.substring(0, 1000),
-                confidence: confidence,
-                processingMethod: option.name,
-                wasCropped: !!cropRegion,
-                cropRegion: cropRegion,
-                success: true
-              };
-              bestConfidence = confidence;
-              bestTextForDebug = text;
-              console.log(`Nuevo mejor resultado con ${option.name}: ${checklistNumber}, Confianza: ${confidence}`);
-            }
-          } else if (!bestResult && confidence > bestConfidence) {
-              bestConfidence = confidence;
-              bestTextForDebug = text;
-          }
-
-        } catch (error) {
-          console.error(`Error en procesamiento ${option.name} para ${filename}:`, error.message);
-        }
-      } else if (option.appliesToCropped && !cropRegion) {
-        console.log(`Omitiendo opción de recorte ${option.name} porque no se pudo recortar la imagen.`);
-      }
-    }
-
-    if (bestResult) {
-      console.log(`Mejor resultado final para ${filename}: ${bestResult.checklistNumber} (Método: ${bestResult.processingMethod}, Cropped: ${bestResult.wasCropped}, Confianza OCR: ${bestResult.confidence}%)`);
-      return bestResult;
-    } else {
-      console.log(`No se pudo extraer número de checklist para ${filename} con métodos tradicionales. Intentando con OpenAI...`);
-      console.log(`Texto con mayor confianza (${bestConfidence}%) para depuración: ${bestTextForDebug.substring(0,300)}`);
-      
-      // Intentar con OpenAI si los métodos tradicionales fallan
-      const openaiResult = await processImageWithOpenAI(imageBuffer, filename);
-      if (openaiResult) {
-        console.log(`OpenAI logró extraer el número de checklist para ${filename}: ${openaiResult.checklistNumber}`);
-        return openaiResult;
-      }
-      
-      // Si OpenAI también falla, devolver error
-      console.log(`Ni los métodos tradicionales ni OpenAI pudieron extraer el número de checklist para ${filename}`);
-      return {
-        filename,
-        checklistNumber: null,
-        error: 'No se pudo extraer número de checklist con ningún método (OCR tradicional + OpenAI).',
-        extractedText: bestTextForDebug.substring(0,1000),
-        wasCropped: !!cropRegion,
-        cropRegion: cropRegion,
-        success: false
-      };
-    }
 
   } catch (error) {
     console.error(`Error general procesando ${filename}:`, error);
@@ -443,21 +305,71 @@ app.get('/api/health', (req, res) => {
 });
 
 // Nueva ruta para procesar imágenes
-app.post('/api/process-images', upload.array('images', 10), async (req, res) => {
+app.post('/api/process-images', (req, res, next) => {
+  // Log para debugging
+  console.log('Headers recibidos:', req.headers);
+  console.log('Content-Type:', req.get('Content-Type'));
+  
+  // Intentar primero con el campo 'images'
+  upload.array('images', 5000)(req, res, (err) => {
+    if (err && err.code === 'LIMIT_UNEXPECTED_FILE') {
+      console.log('Campo "images" no encontrado, intentando con uploadAny...');
+      // Si falla por campo inesperado, intentar con uploadAny
+      uploadAny.any()(req, res, (err2) => {
+        if (err2) {
+          console.error('Error de multer (uploadAny):', err2);
+          return next(err2);
+        }
+        console.log('Archivos procesados con uploadAny');
+        next();
+      });
+    } else if (err) {
+      console.error('Error de multer:', err);
+      return next(err);
+    } else {
+      console.log('Archivos procesados con upload.array');
+      next();
+    }
+  });
+}, async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({
         error: 'No se enviaron imágenes',
-        message: 'Debes enviar al menos una imagen'
+        message: 'Debes enviar al menos una imagen. Asegúrate de que el campo se llame "images" o que los archivos sean válidos.'
       });
     }
 
-    console.log(`Procesando ${req.files.length} imágenes...`);
+    console.log(`Procesando ${req.files.length} imágenes en lotes de 5...`);
 
-    // Procesar todas las imágenes en paralelo
-    const results = await Promise.all(
-      req.files.map(file => processImage(file.buffer, file.originalname))
-    );
+    // Procesar imágenes en lotes de 5 con pausas
+    const batchSize = 5;
+    const results = [];
+    
+    for (let i = 0; i < req.files.length; i += batchSize) {
+      const batch = req.files.slice(i, i + batchSize);
+      const batchNumber = Math.floor(i / batchSize) + 1;
+      const totalBatches = Math.ceil(req.files.length / batchSize);
+      
+      console.log(`Procesando lote ${batchNumber}/${totalBatches} (${batch.length} imágenes)...`);
+      
+      // Procesar el lote actual en paralelo
+      const batchResults = await Promise.all(
+        batch.map(file => processImage(file.buffer, file.originalname))
+      );
+      
+      results.push(...batchResults);
+      
+      console.log(`Lote ${batchNumber}/${totalBatches} completado.`);
+      
+      // Pausa entre lotes (excepto en el último lote)
+      if (i + batchSize < req.files.length) {
+        console.log('Pausando 3 segundos antes del siguiente lote...');
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+    }
+    
+    console.log(`Procesamiento completo: ${results.length} imágenes procesadas.`);
 
     // Filtrar resultados exitosos
     const successfulResults = results.filter(result => result.success);
@@ -480,7 +392,12 @@ app.post('/api/process-images', upload.array('images', 10), async (req, res) => 
       checklistNumbers: successfulResults.map(r => ({
         filename: r.filename,
         checklistNumber: r.checklistNumber,
-        method: r.processingMethod
+        method: r.processingMethod,
+        retryAttempt: r.retryAttempt || 1,
+        processingConfig: r.processingConfig || 'standard',
+        wasCropped: r.wasCropped || false,
+        rotation: r.rotation || 0,
+        confidence: r.confidence || 0
       }))
     });
 
@@ -511,9 +428,23 @@ app.use((error, req, res, next) => {
     if (error.code === 'LIMIT_FILE_SIZE') {
       return res.status(400).json({
         error: 'Archivo demasiado grande',
-        message: 'El tamaño máximo permitido es 10MB'
+        message: 'El tamaño máximo permitido es 500MB'
       });
     }
+    if (error.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({
+        error: 'Campo de archivo inesperado',
+        message: 'El campo de archivo debe llamarse "images". Verifica que estés enviando los archivos con el nombre de campo correcto.',
+        expectedField: 'images',
+        receivedField: error.field || 'desconocido'
+      });
+    }
+    // Manejar otros errores de multer
+    return res.status(400).json({
+      error: 'Error de subida de archivo',
+      message: error.message,
+      code: error.code
+    });
   }
   
   if (error.message === 'Solo se permiten archivos de imagen') {
@@ -523,7 +454,12 @@ app.use((error, req, res, next) => {
     });
   }
   
-  next(error);
+  // Manejar errores generales
+  console.error('Error no manejado:', error);
+  res.status(500).json({
+    error: 'Error interno del servidor',
+    message: 'Ha ocurrido un error inesperado'
+  });
 });
 
 // Manejo de errores 404
@@ -611,63 +547,324 @@ function validateAndCorrectChecklistNumber(number) {
 
 // Función para procesar imagen con Mistral OCR (CORREGIDA)
 // Función para procesar imagen con Mistral OCR (ACTUALIZADA)
-async function processImageWithMistral(imageBuffer, filename) {
+// Función para detectar y recortar el área del papel
+async function detectAndCropPaper(imageBuffer) {
   try {
-    console.log(`Intentando extraer número de checklist con Mistral OCR para ${filename}`);
+    const image = sharp(imageBuffer);
+    const { width, height } = await image.metadata();
+    
+    // Convertir a escala de grises y aplicar detección de bordes
+    const edgeDetected = await image
+      .greyscale()
+      .normalize()
+      .convolve({
+        width: 3,
+        height: 3,
+        kernel: [-1, -1, -1, -1, 8, -1, -1, -1, -1] // Kernel de detección de bordes
+      })
+      .threshold(50)
+      .toBuffer();
+    
+    // Buscar el rectángulo más grande (probablemente el papel)
+    // Esto es una aproximación simple - en un caso real usarías OpenCV
+    const cropRegion = {
+      left: Math.floor(width * 0.05),
+      top: Math.floor(height * 0.05),
+      width: Math.floor(width * 0.9),
+      height: Math.floor(height * 0.9)
+    };
+    
+    const croppedImage = await sharp(imageBuffer)
+      .extract(cropRegion)
+      .toBuffer();
+    
+    return {
+      croppedImage,
+      cropRegion,
+      wasCropped: true
+    };
+  } catch (error) {
+    console.log('Error en detección de papel, usando imagen completa:', error.message);
+    return {
+      croppedImage: imageBuffer,
+      cropRegion: null,
+      wasCropped: false
+    };
+  }
+}
 
-    // Convertir buffer a base64
-    const base64Image = imageBuffer.toString('base64');
+// Función para rotar imagen
+async function rotateImage(imageBuffer, degrees) {
+  try {
+    return await sharp(imageBuffer)
+      .rotate(degrees, { background: { r: 255, g: 255, b: 255, alpha: 1 } })
+      .toBuffer();
+  } catch (error) {
+    console.log(`Error rotando imagen ${degrees}°:`, error.message);
+    return imageBuffer;
+  }
+}
+
+async function processImageWithMistral(imageBuffer, filename, retryAttempt = 0) {
+  const maxRetries = 6; // Aumentado a 6 intentos
+  const rotations = [0, 90, 180, 270, -15, 15]; // Diferentes rotaciones
+  const processingConfigs = [
+    // Configuración estándar
+    {
+      resize: { width: 2000, fit: 'inside', withoutEnlargement: true },
+      greyscale: true,
+      normalize: true,
+      sharpen: true,
+      quality: 95,
+      name: "estándar",
+      detectPaper: false
+    },
+    // Configuración con detección de papel
+    {
+      resize: { width: 2500, fit: 'inside', withoutEnlargement: true },
+      greyscale: true,
+      normalize: true,
+      sharpen: { sigma: 1.2 },
+      quality: 98,
+      name: "detección de papel",
+      detectPaper: true
+    },
+    // Configuración de alta resolución
+    {
+      resize: { width: 3000, fit: 'inside', withoutEnlargement: true },
+      greyscale: true,
+      normalize: true,
+      sharpen: { sigma: 1.5 },
+      contrast: 1.2,
+      brightness: 1.1,
+      quality: 98,
+      name: "alta resolución",
+      detectPaper: false
+    },
+    // Configuración para texto difícil
+    {
+      resize: { width: 2500, fit: 'inside', withoutEnlargement: true },
+      greyscale: true,
+      normalize: true,
+      sharpen: { sigma: 2 },
+      contrast: 1.5,
+      threshold: 128,
+      quality: 100,
+      name: "texto difícil",
+      detectPaper: true
+    },
+    // Configuración con rotación y detección
+    {
+      resize: { width: 2200, fit: 'inside', withoutEnlargement: true },
+      greyscale: true,
+      normalize: true,
+      sharpen: { sigma: 1.8 },
+      contrast: 1.3,
+      quality: 97,
+      name: "rotación y detección",
+      detectPaper: true,
+      useRotation: true
+    },
+    // Configuración extrema
+    {
+      resize: { width: 3500, fit: 'inside', withoutEnlargement: true },
+      greyscale: true,
+      normalize: true,
+      sharpen: { sigma: 2.5 },
+      contrast: 1.8,
+      brightness: 1.2,
+      threshold: 100,
+      quality: 100,
+      name: "extrema",
+      detectPaper: true,
+      useRotation: true
+    }
+  ];
+
+  try {
+    const config = processingConfigs[retryAttempt] || processingConfigs[0];
+    console.log(`Intento ${retryAttempt + 1}/${maxRetries} con configuración ${config.name} para ${filename}`);
+
+    let workingBuffer = imageBuffer;
+    let cropInfo = { wasCropped: false, cropRegion: null };
+
+    // Paso 1: Detección y recorte de papel si está habilitado
+    if (config.detectPaper) {
+      console.log(`Detectando área del papel para ${filename}...`);
+      const paperDetection = await detectAndCropPaper(workingBuffer);
+      workingBuffer = paperDetection.croppedImage;
+      cropInfo = {
+        wasCropped: paperDetection.wasCropped,
+        cropRegion: paperDetection.cropRegion
+      };
+      if (paperDetection.wasCropped) {
+        console.log(`Papel detectado y recortado para ${filename}`);
+      }
+    }
+
+    // Paso 2: Rotación si está habilitada
+    if (config.useRotation && retryAttempt < rotations.length) {
+      const rotation = rotations[retryAttempt];
+      if (rotation !== 0) {
+        console.log(`Aplicando rotación de ${rotation}° para ${filename}...`);
+        workingBuffer = await rotateImage(workingBuffer, rotation);
+      }
+    }
+
+    // Paso 3: Preprocesar la imagen con la configuración específica
+    let imageProcessor = sharp(workingBuffer)
+      .resize(config.resize);
+
+    if (config.greyscale) imageProcessor = imageProcessor.greyscale();
+    if (config.normalize) imageProcessor = imageProcessor.normalize();
+    if (config.sharpen) imageProcessor = imageProcessor.sharpen(config.sharpen);
+    if (config.contrast) imageProcessor = imageProcessor.modulate({ brightness: config.brightness || 1, contrast: config.contrast });
+    if (config.threshold) imageProcessor = imageProcessor.threshold(config.threshold);
+
+    const processedImage = await imageProcessor
+      .jpeg({ quality: config.quality })
+      .toBuffer();
+
+    // Convertir buffer procesado a base64
+    const base64Image = processedImage.toString('base64');
+
+    // Prompts progresivamente más específicos y adaptados
+    const prompts = [
+      // Intento 1: Búsqueda estándar
+      "Examina cuidadosamente esta imagen y busca un número de checklist. " +
+      "Busca texto como: 'Checklist N°', 'Checklist Nº', 'Checklist N', 'Checklist No', " +
+      "'Check List N°', 'CHECKLIST N°', o cualquier variación similar. " +
+      "El número debe tener entre 5 y 7 dígitos. " +
+      "Examina toda la imagen, incluyendo esquinas, bordes y áreas con texto pequeño. " +
+      "Si encuentras el número, responde ÚNICAMENTE con esos dígitos. " +
+      "Si no encuentras ningún número de checklist, responde exactamente 'NO_ENCONTRADO'.",
+      
+      // Intento 2: Con detección de papel
+      "Esta imagen muestra un documento o papel. Busca un número de checklist de 5-7 dígitos. " +
+      "El número puede aparecer cerca de palabras como: 'Checklist', 'Check', 'List', 'N°', 'Nº', 'No', 'Número'. " +
+      "Busca en TODA la superficie del papel: encabezados, pies de página, márgenes, esquinas. " +
+      "El número puede estar en diferentes formatos: 123456, 12-34-56, 12.34.56, etc. " +
+      "Responde SOLO con los dígitos del número encontrado, sin espacios ni símbolos. " +
+      "Si no encuentras nada, responde 'NO_ENCONTRADO'.",
+      
+      // Intento 3: Alta resolución
+      "Analiza esta imagen de alta resolución buscando un número de checklist. " +
+      "Busca CUALQUIER secuencia de 5, 6 o 7 dígitos consecutivos. " +
+      "Examina texto pequeño, códigos, sellos, firmas, watermarks. " +
+      "El número puede estar en cualquier orientación o tamaño. " +
+      "Lista el primer número de 5-7 dígitos que encuentres. " +
+      "Si no encuentras ninguno, responde 'NO_ENCONTRADO'.",
+      
+      // Intento 4: Texto difícil con umbralización
+      "Esta imagen ha sido procesada para mejorar la legibilidad del texto. " +
+      "Busca números de checklist que pueden estar borrosos, desenfocados o con poco contraste. " +
+      "Busca secuencias de 5-7 dígitos cerca de palabras relacionadas con 'checklist'. " +
+      "El texto puede aparecer distorsionado pero los números deben ser reconocibles. " +
+      "Responde con el número encontrado o 'NO_ENCONTRADO'.",
+      
+      // Intento 5: Con rotación
+      "Esta imagen puede estar rotada. Busca un número de checklist considerando que el texto " +
+      "puede estar en diferentes orientaciones. Busca números de 5-7 dígitos que aparezcan " +
+      "cerca de texto que pueda decir 'Checklist', 'Check List', o variaciones similares. " +
+      "El documento puede estar girado, pero los números deben ser legibles. " +
+      "Responde solo con los dígitos encontrados o 'NO_ENCONTRADO'.",
+      
+      // Intento 6: Búsqueda extrema
+      "ANÁLISIS EXHAUSTIVO: Examina cada píxel de esta imagen buscando CUALQUIER número de 5-7 dígitos. " +
+      "Ignora completamente el contexto. Solo busca secuencias numéricas. " +
+      "Pueden estar en: códigos de barras, sellos, firmas, fondos, bordes, esquinas, " +
+      "texto pequeño, borroso, rotado, parcialmente oculto o cortado. " +
+      "Lista TODOS los números de 5-7 dígitos que encuentres, separados por comas. " +
+      "Si no encuentras absolutamente ninguno, responde 'NO_ENCONTRADO'."
+    ];
 
     const response = await mistral.chat.complete({
-      model: "pixtral-12b-latest",          // o "pixtral-12b-2409"
+      model: "pixtral-12b-latest",
       messages: [
         {
           role: "user",
           content: [
             {
               type: "text",
-              text:
-                "Analiza esta imagen y extrae únicamente el número de checklist. " +
-                "Busca texto que contenga 'Checklist N°', 'Checklist Nº', 'Checklist N', " +
-                "o variaciones similares, seguido de un número de 5-7 dígitos. " +
-                "Responde SOLO con el número encontrado, sin texto adicional. " +
-                "Si no encuentras un número de checklist válido, responde 'NO_ENCONTRADO'."
+              text: prompts[retryAttempt] || prompts[0]
             },
             {
               type: "image_url",
-              imageUrl: `data:image/jpeg;base64,${base64Image}`  // <- camelCase
+              imageUrl: `data:image/jpeg;base64,${base64Image}`
             }
           ]
         }
       ],
-      max_tokens: 50
+      max_tokens: 150
     });
 
     const extractedText = response.choices?.[0]?.message?.content?.trim();
-    console.log(`Respuesta de Mistral para ${filename}: ${extractedText}`);
+    console.log(`Respuesta de Mistral (intento ${retryAttempt + 1}) para ${filename}: ${extractedText}`);
 
     if (extractedText && extractedText !== "NO_ENCONTRADO") {
-      const cleanNumber = extractedText.replace(/[^0-9]/g, "");
-      if (cleanNumber.length >= 5 && cleanNumber.length <= 7) {
-        const fixedNumber = fix(cleanNumber);      // usa tu función fix()
-        console.log(`Mistral extrajo número de checklist: ${fixedNumber} para ${filename}`);
+      // Buscar números en la respuesta de manera más flexible
+      const numberMatches = extractedText.match(/\d{5,7}/g);
+      
+      if (numberMatches && numberMatches.length > 0) {
+        // Tomar el primer número válido encontrado
+        const cleanNumber = numberMatches[0];
+        const fixedNumber = fix(cleanNumber);
+        console.log(`Mistral extrajo número de checklist: ${fixedNumber} para ${filename} (intento ${retryAttempt + 1})`);
         return {
           filename,
           checklistNumber: fixedNumber,
           extractedText,
-          confidence: 90,
-          processingMethod: "mistral_ocr",
-          wasCropped: false,
-          cropRegion: null,
-          success: true
+          confidence: 90 - (retryAttempt * 3), // Reducir confianza gradualmente
+          processingMethod: `mistral_ocr_attempt_${retryAttempt + 1}`,
+          wasCropped: cropInfo.wasCropped,
+          cropRegion: cropInfo.cropRegion,
+          rotation: config.useRotation && retryAttempt < rotations.length ? rotations[retryAttempt] : 0,
+          processingConfig: config.name,
+          success: true,
+          retryAttempt: retryAttempt + 1
+        };
+      }
+      
+      // Si no hay números de 5-7 dígitos, intentar extraer cualquier número y limpiarlo
+      const allNumbers = extractedText.replace(/[^0-9]/g, "");
+      if (allNumbers.length >= 5 && allNumbers.length <= 7) {
+        const fixedNumber = fix(allNumbers);
+        console.log(`Mistral extrajo número de checklist (limpiado): ${fixedNumber} para ${filename} (intento ${retryAttempt + 1})`);
+        return {
+          filename,
+          checklistNumber: fixedNumber,
+          extractedText,
+          confidence: 85 - (retryAttempt * 3),
+          processingMethod: `mistral_ocr_attempt_${retryAttempt + 1}`,
+          wasCropped: cropInfo.wasCropped,
+          cropRegion: cropInfo.cropRegion,
+          rotation: config.useRotation && retryAttempt < rotations.length ? rotations[retryAttempt] : 0,
+          processingConfig: config.name,
+          success: true,
+          retryAttempt: retryAttempt + 1
         };
       }
     }
 
-    console.log(`Mistral no pudo extraer un número válido de checklist para ${filename}`);
+    // Si este intento falló y aún hay reintentos disponibles
+    if (retryAttempt < maxRetries - 1) {
+      console.log(`Intento ${retryAttempt + 1} falló para ${filename}, probando con configuración diferente...`);
+      await new Promise(resolve => setTimeout(resolve, 1000)); // Pausa de 1 segundo
+      return await processImageWithMistral(imageBuffer, filename, retryAttempt + 1);
+    }
+
+    console.log(`Todos los intentos fallaron para ${filename}`);
     return null;
   } catch (error) {
-    console.error(`Error procesando ${filename} con Mistral:`, error.message);
+    console.error(`Error en intento ${retryAttempt + 1} procesando ${filename} con Mistral:`, error.message);
+    
+    // Si hay error y aún quedan reintentos
+    if (retryAttempt < maxRetries - 1) {
+      console.log(`Error en intento ${retryAttempt + 1}, reintentando...`);
+      await new Promise(resolve => setTimeout(resolve, 2000)); // Pausa más larga en caso de error
+      return await processImageWithMistral(imageBuffer, filename, retryAttempt + 1);
+    }
+    
     return null;
   }
 }
