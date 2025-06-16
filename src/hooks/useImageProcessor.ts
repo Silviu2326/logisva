@@ -43,7 +43,7 @@ export function useImageProcessor() {
       setProgress(25);
       
       // Enviar al backend - DO NOT set Content-Type header
-      const response = await fetch('http://localhost:3001/api/process-images', {
+      const response = await fetch('https://logisvaa-fa905005c15b.herokuapp.com//api/process-images', {
         method: 'POST',
         body: formData,
           });
