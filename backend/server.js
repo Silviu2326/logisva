@@ -79,7 +79,7 @@ app.use(cors({
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Session-Id']
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -314,6 +314,42 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Store para manejar conexiones SSE
+const sseConnections = new Map();
+
+// Ruta para Server-Sent Events (progreso en tiempo real)
+app.get('/api/progress/:sessionId', (req, res) => {
+  const sessionId = req.params.sessionId;
+  
+  // Configurar headers para SSE
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Cache-Control'
+  });
+  
+  // Guardar la conexión
+  sseConnections.set(sessionId, res);
+  
+  // Enviar mensaje inicial
+  res.write(`data: ${JSON.stringify({ type: 'connected', sessionId })}\n\n`);
+  
+  // Limpiar conexión cuando se cierre
+  req.on('close', () => {
+    sseConnections.delete(sessionId);
+  });
+});
+
+// Función para enviar progreso via SSE
+function sendProgress(sessionId, data) {
+  const connection = sseConnections.get(sessionId);
+  if (connection) {
+    connection.write(`data: ${JSON.stringify(data)}\n\n`);
+  }
+}
+
 // Nueva ruta para procesar imágenes
 app.post('/api/process-images', (req, res, next) => {
   // Log para debugging
@@ -342,6 +378,8 @@ app.post('/api/process-images', (req, res, next) => {
     }
   });
 }, async (req, res) => {
+  const sessionId = req.headers['x-session-id'] || 'default';
+  
   try {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({
@@ -351,10 +389,20 @@ app.post('/api/process-images', (req, res, next) => {
     }
 
     console.log(`Procesando ${req.files.length} imágenes en lotes de 5...`);
+    
+    // Enviar progreso inicial
+    sendProgress(sessionId, {
+      type: 'progress',
+      stage: 'starting',
+      progress: 0,
+      message: `Iniciando procesamiento de ${req.files.length} imágenes...`,
+      totalImages: req.files.length
+    });
 
     // Procesar imágenes en lotes de 5 con pausas
     const batchSize = 5;
     const results = [];
+    const totalImages = req.files.length;
     
     for (let i = 0; i < req.files.length; i += batchSize) {
       const batch = req.files.slice(i, i + batchSize);
@@ -363,10 +411,51 @@ app.post('/api/process-images', (req, res, next) => {
       
       console.log(`Procesando lote ${batchNumber}/${totalBatches} (${batch.length} imágenes)...`);
       
-      // Procesar el lote actual en paralelo
-      const batchResults = await Promise.all(
-        batch.map(file => processImage(file.buffer, file.originalname))
-      );
+      // Enviar progreso del lote
+      const progressPercent = Math.round((i / totalImages) * 100);
+      sendProgress(sessionId, {
+        type: 'progress',
+        stage: 'processing',
+        progress: progressPercent,
+        message: `Procesando lote ${batchNumber}/${totalBatches} (${batch.length} imágenes)...`,
+        currentBatch: batchNumber,
+        totalBatches: totalBatches,
+        processedImages: i
+      });
+      
+      // Procesar cada imagen del lote individualmente para mejor granularidad
+      const batchResults = [];
+      for (let j = 0; j < batch.length; j++) {
+        const file = batch[j];
+        const imageIndex = i + j + 1;
+        
+        // Enviar progreso por imagen
+        sendProgress(sessionId, {
+          type: 'progress',
+          stage: 'processing_image',
+          progress: Math.round((imageIndex / totalImages) * 100),
+          message: `Procesando imagen ${imageIndex}/${totalImages}: ${file.originalname}`,
+          currentImage: imageIndex,
+          fileName: file.originalname
+        });
+        
+        const result = await processImage(file.buffer, file.originalname);
+        batchResults.push(result);
+        
+        // Enviar resultado de la imagen procesada
+        sendProgress(sessionId, {
+          type: 'image_completed',
+          stage: 'image_done',
+          progress: Math.round((imageIndex / totalImages) * 100),
+          message: `Imagen ${imageIndex}/${totalImages} completada: ${result.success ? 'Éxito' : 'Error'}`,
+          result: {
+            fileName: result.filename,
+            success: result.success,
+            checklistNumber: result.checklistNumber,
+            error: result.error
+          }
+        });
+      }
       
       results.push(...batchResults);
       
@@ -374,12 +463,28 @@ app.post('/api/process-images', (req, res, next) => {
       
       // Pausa entre lotes (excepto en el último lote)
       if (i + batchSize < req.files.length) {
+        sendProgress(sessionId, {
+          type: 'progress',
+          stage: 'waiting',
+          progress: Math.round(((i + batchSize) / totalImages) * 100),
+          message: 'Pausando 3 segundos antes del siguiente lote...',
+          waitTime: 3000
+        });
+        
         console.log('Pausando 3 segundos antes del siguiente lote...');
         await new Promise(resolve => setTimeout(resolve, 3000));
       }
     }
     
     console.log(`Procesamiento completo: ${results.length} imágenes procesadas.`);
+    
+    // Enviar progreso final
+    sendProgress(sessionId, {
+      type: 'progress',
+      stage: 'completing',
+      progress: 95,
+      message: 'Finalizando procesamiento y preparando resultados...'
+    });
 
     // Filtrar resultados exitosos
     const successfulResults = results.filter(result => result.success);
@@ -390,7 +495,7 @@ app.post('/api/process-images', (req, res, next) => {
       result.processingMethod !== 'mistral_ocr' && result.processingMethod !== 'openai_vision'
     );
     
-    res.json({
+    const finalResponse = {
       message: 'Procesamiento completado',
       totalImages: req.files.length,
       successfulExtractions: successfulResults.length,
@@ -409,10 +514,40 @@ app.post('/api/process-images', (req, res, next) => {
         rotation: r.rotation || 0,
         confidence: r.confidence || 0
       }))
+    };
+    
+    // Enviar progreso completado
+    sendProgress(sessionId, {
+      type: 'completed',
+      stage: 'completed',
+      progress: 100,
+      message: `Procesamiento completado: ${successfulResults.length}/${totalImages} imágenes procesadas exitosamente`,
+      results: finalResponse
     });
+    
+    // Cerrar conexión SSE después de un breve delay
+    setTimeout(() => {
+      const connection = sseConnections.get(sessionId);
+      if (connection) {
+        connection.end();
+        sseConnections.delete(sessionId);
+      }
+    }, 1000);
+    
+    res.json(finalResponse);
 
   } catch (error) {
     console.error('Error en el procesamiento:', error);
+    
+    // Enviar error via SSE
+    sendProgress(sessionId, {
+      type: 'error',
+      stage: 'error',
+      progress: 0,
+      message: `Error en el procesamiento: ${error.message}`,
+      error: error.message
+    });
+    
     res.status(500).json({
       error: 'Error interno del servidor',
       message: error.message
