@@ -29,6 +29,8 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -256,12 +258,42 @@ async function deskew(buffer) {
 }
 
 async function processImage(imageBuffer, filename) {
+  let workingBuffer = null;
+  let processedImage = null;
+  
   try {
-    console.log(`Iniciando procesamiento de ${filename}`);
+    console.log(`Iniciando procesamiento optimizado de ${filename}`);
+    
+    // Verificar tamaño del buffer antes de procesar
+    const bufferSizeMB = imageBuffer.length / (1024 * 1024);
+    console.log(`Tamaño de imagen ${filename}: ${bufferSizeMB.toFixed(2)} MB`);
+    
+    // Limitar tamaño de imagen para evitar problemas de memoria
+    if (bufferSizeMB > 50) {
+      console.log(`Imagen ${filename} demasiado grande (${bufferSizeMB.toFixed(2)} MB), redimensionando...`);
+      try {
+        processedImage = await sharp(imageBuffer)
+          .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 85 })
+          .toBuffer();
+        workingBuffer = processedImage;
+        processedImage = null; // Liberar referencia inmediatamente
+      } catch (resizeError) {
+        console.error(`Error redimensionando ${filename}:`, resizeError.message);
+        workingBuffer = Buffer.from(imageBuffer);
+      }
+    } else {
+      // Crear una copia del buffer para trabajar
+      workingBuffer = Buffer.from(imageBuffer);
+    }
     
     // Solo usar Mistral OCR (sin fallback a métodos tradicionales)
     console.log(`Intentando extracción con Mistral OCR para ${filename}`);
-    const mistralResult = await processImageWithMistral(imageBuffer, filename);
+    const mistralResult = await processImageWithMistral(workingBuffer, filename);
+    
+    // Liberar buffer de trabajo inmediatamente después del procesamiento
+    workingBuffer = null;
+    
     if (mistralResult) {
       console.log(`Mistral logró extraer el número de checklist para ${filename}: ${mistralResult.checklistNumber}`);
       return mistralResult;
@@ -279,18 +311,27 @@ async function processImage(imageBuffer, filename) {
       success: false
     };
     
-
-
   } catch (error) {
     console.error(`Error general procesando ${filename}:`, error);
+    
     return {
       filename,
       checklistNumber: null,
       error: error.message,
-      wasCropped: false, // Asegurarse de que estos campos existan incluso en error general
+      wasCropped: false,
       cropRegion: null,
       success: false
     };
+  } finally {
+    // Asegurar liberación completa de memoria
+    workingBuffer = null;
+    processedImage = null;
+    
+    // Forzar liberación de memoria después de cada imagen
+    if (global.gc) {
+      global.gc();
+      console.log(`Memoria liberada después de procesar ${filename}`);
+    }
   }
 }
 
@@ -314,40 +355,9 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Store para manejar conexiones SSE
-const sseConnections = new Map();
-
-// Ruta para Server-Sent Events (progreso en tiempo real)
-app.get('/api/progress/:sessionId', (req, res) => {
-  const sessionId = req.params.sessionId;
-  
-  // Configurar headers para SSE
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Cache-Control'
-  });
-  
-  // Guardar la conexión
-  sseConnections.set(sessionId, res);
-  
-  // Enviar mensaje inicial
-  res.write(`data: ${JSON.stringify({ type: 'connected', sessionId })}\n\n`);
-  
-  // Limpiar conexión cuando se cierre
-  req.on('close', () => {
-    sseConnections.delete(sessionId);
-  });
-});
-
-// Función para enviar progreso via SSE
-function sendProgress(sessionId, data) {
-  const connection = sseConnections.get(sessionId);
-  if (connection) {
-    connection.write(`data: ${JSON.stringify(data)}\n\n`);
-  }
+// Función simplificada para logging (sin SSE)
+function logProgress(sessionId, data) {
+  console.log(`[${sessionId}] ${data.stage}: ${data.message}`);
 }
 
 // Nueva ruta para procesar imágenes
@@ -378,179 +388,127 @@ app.post('/api/process-images', (req, res, next) => {
     }
   });
 }, async (req, res) => {
-  const sessionId = req.headers['x-session-id'] || 'default';
+  const sessionId = req.headers['x-session-id'] || `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const processingStartTime = Date.now();
+  
+  console.log(`Iniciando procesamiento para sessionId: ${sessionId}`);
   
   try {
+    // Verificar API keys
+    if (!process.env.MISTRAL_API_KEY) {
+      console.error('❌ MISTRAL_API_KEY no está configurada');
+      return res.status(500).json({
+        error: 'Configuración del servidor incompleta',
+        message: 'La clave API de Mistral no está configurada. Contacta al administrador.'
+      });
+    }
+    
     if (!req.files || req.files.length === 0) {
+      console.log('❌ No se recibieron archivos');
       return res.status(400).json({
         error: 'No se enviaron imágenes',
         message: 'Debes enviar al menos una imagen. Asegúrate de que el campo se llame "images" o que los archivos sean válidos.'
       });
     }
 
-    console.log(`Procesando ${req.files.length} imágenes en lotes de 5...`);
+    // Limitar el número de imágenes por lote para evitar problemas de memoria
+    const maxImagesPerBatch = 5;
+    if (req.files.length > maxImagesPerBatch) {
+      return res.status(400).json({
+        error: 'Demasiadas imágenes',
+        message: `Por favor, procesa máximo ${maxImagesPerBatch} imágenes a la vez para evitar problemas de memoria.`,
+        receivedImages: req.files.length,
+        maxAllowed: maxImagesPerBatch
+      });
+    }
     
-    // Enviar progreso inicial
-    sendProgress(sessionId, {
-      type: 'progress',
-      stage: 'starting',
-      progress: 0,
-      message: `Iniciando procesamiento de ${req.files.length} imágenes...`,
-      totalImages: req.files.length
-    });
+    console.log(`Procesando ${req.files.length} imágenes...`);
 
-    // Procesar imágenes en lotes de 5 con pausas
-    const batchSize = 5;
+    // Procesar imágenes de una en una para optimizar memoria
     const results = [];
     const totalImages = req.files.length;
     
-    for (let i = 0; i < req.files.length; i += batchSize) {
-      const batch = req.files.slice(i, i + batchSize);
-      const batchNumber = Math.floor(i / batchSize) + 1;
-      const totalBatches = Math.ceil(req.files.length / batchSize);
+    for (let i = 0; i < req.files.length; i++) {
+      const file = req.files[i];
+      const imageIndex = i + 1;
       
-      console.log(`Procesando lote ${batchNumber}/${totalBatches} (${batch.length} imágenes)...`);
+      console.log(`Procesando imagen ${imageIndex}/${totalImages}: ${file.originalname}`);
       
-      // Enviar progreso del lote
-      const progressPercent = Math.round((i / totalImages) * 100);
-      sendProgress(sessionId, {
-        type: 'progress',
-        stage: 'processing',
-        progress: progressPercent,
-        message: `Procesando lote ${batchNumber}/${totalBatches} (${batch.length} imágenes)...`,
-        currentBatch: batchNumber,
-        totalBatches: totalBatches,
-        processedImages: i
-      });
-      
-      // Procesar cada imagen del lote individualmente para mejor granularidad
-      const batchResults = [];
-      for (let j = 0; j < batch.length; j++) {
-        const file = batch[j];
-        const imageIndex = i + j + 1;
-        
-        // Enviar progreso por imagen
-        sendProgress(sessionId, {
-          type: 'progress',
-          stage: 'processing_image',
-          progress: Math.round((imageIndex / totalImages) * 100),
-          message: `Procesando imagen ${imageIndex}/${totalImages}: ${file.originalname}`,
-          currentImage: imageIndex,
-          fileName: file.originalname
-        });
-        
+      try {
+        // Procesar la imagen
         const result = await processImage(file.buffer, file.originalname);
-        batchResults.push(result);
+        results.push(result);
         
-        // Enviar resultado de la imagen procesada
-        sendProgress(sessionId, {
-          type: 'image_completed',
-          stage: 'image_done',
-          progress: Math.round((imageIndex / totalImages) * 100),
-          message: `Imagen ${imageIndex}/${totalImages} completada: ${result.success ? 'Éxito' : 'Error'}`,
-          result: {
-            fileName: result.filename,
-            success: result.success,
-            checklistNumber: result.checklistNumber,
-            error: result.error
-          }
-        });
+        console.log(`Imagen ${imageIndex}/${totalImages} procesada: ${result.success ? 'Éxito' : 'Error'}`);
+        
+      } catch (error) {
+        console.error(`Error procesando imagen ${imageIndex}: ${error.message}`);
+        const errorResult = {
+          filename: file.originalname,
+          checklistNumber: null,
+          error: error.message,
+          success: false,
+          wasCropped: false,
+          cropRegion: null,
+          processingMethod: 'error',
+          confidence: 0
+        };
+        results.push(errorResult);
       }
       
-      results.push(...batchResults);
+      // Pausa entre imágenes para optimizar memoria
+      if (i < req.files.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
       
-      console.log(`Lote ${batchNumber}/${totalBatches} completado.`);
-      
-      // Pausa entre lotes (excepto en el último lote)
-      if (i + batchSize < req.files.length) {
-        sendProgress(sessionId, {
-          type: 'progress',
-          stage: 'waiting',
-          progress: Math.round(((i + batchSize) / totalImages) * 100),
-          message: 'Pausando 3 segundos antes del siguiente lote...',
-          waitTime: 3000
-        });
-        
-        console.log('Pausando 3 segundos antes del siguiente lote...');
-        await new Promise(resolve => setTimeout(resolve, 3000));
+      // Forzar liberación de memoria cada imagen
+      if (global.gc) {
+        global.gc();
       }
     }
     
     console.log(`Procesamiento completo: ${results.length} imágenes procesadas.`);
     
-    // Enviar progreso final
-    sendProgress(sessionId, {
-      type: 'progress',
-      stage: 'completing',
-      progress: 95,
-      message: 'Finalizando procesamiento y preparando resultados...'
-    });
-
     // Filtrar resultados exitosos
     const successfulResults = results.filter(result => result.success);
     const failedResults = results.filter(result => !result.success);
     const mistralResults = successfulResults.filter(result => result.processingMethod === 'mistral_ocr');
     const openaiResults = successfulResults.filter(result => result.processingMethod === 'openai_vision');
-    const traditionalResults = successfulResults.filter(result => 
-      result.processingMethod !== 'mistral_ocr' && result.processingMethod !== 'openai_vision'
-    );
+    
+    const processingTime = Date.now() - processingStartTime;
     
     const finalResponse = {
+      success: true,
       message: 'Procesamiento completado',
+      sessionId: sessionId,
       totalImages: req.files.length,
       successfulExtractions: successfulResults.length,
       failedExtractions: failedResults.length,
       mistralOcrSuccess: mistralResults.length,
-      traditionalOcrSuccess: traditionalResults.length,
       openaiSuccess: openaiResults.length,
+      processingTimeMs: processingTime,
+      processingTimeSec: Math.round(processingTime / 1000),
       results: results,
       checklistNumbers: successfulResults.map(r => ({
         filename: r.filename,
         checklistNumber: r.checklistNumber,
         method: r.processingMethod,
-        retryAttempt: r.retryAttempt || 1,
-        processingConfig: r.processingConfig || 'standard',
-        wasCropped: r.wasCropped || false,
-        rotation: r.rotation || 0,
         confidence: r.confidence || 0
       }))
     };
     
-    // Enviar progreso completado
-    sendProgress(sessionId, {
-      type: 'completed',
-      stage: 'completed',
-      progress: 100,
-      message: `Procesamiento completado: ${successfulResults.length}/${totalImages} imágenes procesadas exitosamente`,
-      results: finalResponse
-    });
-    
-    // Cerrar conexión SSE después de un breve delay
-    setTimeout(() => {
-      const connection = sseConnections.get(sessionId);
-      if (connection) {
-        connection.end();
-        sseConnections.delete(sessionId);
-      }
-    }, 1000);
+    console.log(`Procesamiento completado: ${successfulResults.length}/${totalImages} imágenes exitosas en ${Math.round(processingTime / 1000)}s`);
     
     res.json(finalResponse);
 
   } catch (error) {
     console.error('Error en el procesamiento:', error);
     
-    // Enviar error via SSE
-    sendProgress(sessionId, {
-      type: 'error',
-      stage: 'error',
-      progress: 0,
-      message: `Error en el procesamiento: ${error.message}`,
-      error: error.message
-    });
-    
     res.status(500).json({
+      success: false,
       error: 'Error interno del servidor',
-      message: error.message
+      message: error.message,
+      sessionId: sessionId
     });
   }
 });
@@ -692,14 +650,18 @@ function validateAndCorrectChecklistNumber(number) {
 
 // Función para procesar imagen con Mistral OCR (CORREGIDA)
 // Función para procesar imagen con Mistral OCR (ACTUALIZADA)
-// Función para detectar y recortar el área del papel
+// Función para detectar y recortar el área del papel (optimizada para memoria)
 async function detectAndCropPaper(imageBuffer) {
+  let edgeDetected = null;
+  let image = null;
+  let croppedImage = null;
+  
   try {
-    const image = sharp(imageBuffer);
+    image = sharp(imageBuffer);
     const { width, height } = await image.metadata();
     
     // Convertir a escala de grises y aplicar detección de bordes
-    const edgeDetected = await image
+    edgeDetected = await image
       .greyscale()
       .normalize()
       .convolve({
@@ -710,6 +672,9 @@ async function detectAndCropPaper(imageBuffer) {
       .threshold(50)
       .toBuffer();
     
+    // Liberar imagen original inmediatamente
+    image = null;
+    
     // Buscar el rectángulo más grande (probablemente el papel)
     // Esto es una aproximación simple - en un caso real usarías OpenCV
     const cropRegion = {
@@ -719,7 +684,7 @@ async function detectAndCropPaper(imageBuffer) {
       height: Math.floor(height * 0.9)
     };
     
-    const croppedImage = await sharp(imageBuffer)
+    croppedImage = await sharp(imageBuffer)
       .extract(cropRegion)
       .toBuffer();
     
@@ -735,283 +700,194 @@ async function detectAndCropPaper(imageBuffer) {
       cropRegion: null,
       wasCropped: false
     };
+  } finally {
+    // Liberar memoria
+    edgeDetected = null;
+    image = null;
+    croppedImage = null;
+    if (global.gc) {
+      global.gc();
+    }
   }
 }
 
-// Función para rotar imagen
+// Función para rotar imagen (optimizada para memoria)
 async function rotateImage(imageBuffer, degrees) {
+  let rotatedBuffer = null;
+  
   try {
-    return await sharp(imageBuffer)
+    rotatedBuffer = await sharp(imageBuffer)
       .rotate(degrees, { background: { r: 255, g: 255, b: 255, alpha: 1 } })
       .toBuffer();
+    
+    return rotatedBuffer;
+    
   } catch (error) {
     console.log(`Error rotando imagen ${degrees}°:`, error.message);
     return imageBuffer;
+  } finally {
+    // Liberar memoria si hay error
+    if (global.gc) {
+      global.gc();
+    }
   }
 }
 
-async function processImageWithMistral(imageBuffer, filename, retryAttempt = 0) {
-  const maxRetries = 6; // Aumentado a 6 intentos
-  const rotations = [0, 90, 180, 270, -15, 15]; // Diferentes rotaciones
-  const processingConfigs = [
-    // Configuración estándar
-    {
-      resize: { width: 2000, fit: 'inside', withoutEnlargement: true },
-      greyscale: true,
-      normalize: true,
-      sharpen: true,
-      quality: 95,
-      name: "estándar",
-      detectPaper: false
-    },
-    // Configuración con detección de papel
-    {
-      resize: { width: 2500, fit: 'inside', withoutEnlargement: true },
-      greyscale: true,
-      normalize: true,
-      sharpen: { sigma: 1.2 },
-      quality: 98,
-      name: "detección de papel",
-      detectPaper: true
-    },
-    // Configuración de alta resolución
-    {
-      resize: { width: 3000, fit: 'inside', withoutEnlargement: true },
-      greyscale: true,
-      normalize: true,
-      sharpen: { sigma: 1.5 },
-      contrast: 1.2,
-      brightness: 1.1,
-      quality: 98,
-      name: "alta resolución",
-      detectPaper: false
-    },
-    // Configuración para texto difícil
-    {
-      resize: { width: 2500, fit: 'inside', withoutEnlargement: true },
-      greyscale: true,
-      normalize: true,
-      sharpen: { sigma: 2 },
-      contrast: 1.5,
-      threshold: 128,
-      quality: 100,
-      name: "texto difícil",
-      detectPaper: true
-    },
-    // Configuración con rotación y detección
-    {
-      resize: { width: 2200, fit: 'inside', withoutEnlargement: true },
-      greyscale: true,
-      normalize: true,
-      sharpen: { sigma: 1.8 },
-      contrast: 1.3,
-      quality: 97,
-      name: "rotación y detección",
-      detectPaper: true,
-      useRotation: true
-    },
-    // Configuración extrema
-    {
-      resize: { width: 3500, fit: 'inside', withoutEnlargement: true },
-      greyscale: true,
-      normalize: true,
-      sharpen: { sigma: 2.5 },
-      contrast: 1.8,
-      brightness: 1.2,
-      threshold: 100,
-      quality: 100,
-      name: "extrema",
-      detectPaper: true,
-      useRotation: true
-    }
+async function processImageWithMistral(imageBuffer, filename) {
+  let workingBuffer = null;
+  let processedImage = null;
+  let base64Image = null;
+  
+  // Reducir número de intentos para evitar timeouts
+  const maxRetries = 3;
+  const retryConfigs = [
+    { name: 'estándar', enhance: false, crop: false, rotate: 0, resolution: 'normal' },
+    { name: 'mejorado', enhance: true, crop: false, rotate: 0, resolution: 'high' },
+    { name: 'detección de papel', enhance: true, crop: true, rotate: 0, resolution: 'high' }
   ];
-
-  try {
-    const config = processingConfigs[retryAttempt] || processingConfigs[0];
-    console.log(`Intento ${retryAttempt + 1}/${maxRetries} con configuración ${config.name} para ${filename}`);
-
-    let workingBuffer = imageBuffer;
-    let cropInfo = { wasCropped: false, cropRegion: null };
-
-    // Paso 1: Detección y recorte de papel si está habilitado
-    if (config.detectPaper) {
-      console.log(`Detectando área del papel para ${filename}...`);
-      const paperDetection = await detectAndCropPaper(workingBuffer);
-      workingBuffer = paperDetection.croppedImage;
-      cropInfo = {
-        wasCropped: paperDetection.wasCropped,
-        cropRegion: paperDetection.cropRegion
-      };
-      if (paperDetection.wasCropped) {
-        console.log(`Papel detectado y recortado para ${filename}`);
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const config = retryConfigs[attempt];
+    console.log(`Intento ${attempt + 1}/${maxRetries} con configuración ${config.name} para ${filename}`);
+    
+    try {
+      // Crear buffer de trabajo más pequeño si es necesario
+      const bufferSizeMB = imageBuffer.length / (1024 * 1024);
+      if (bufferSizeMB > 10) {
+        console.log(`Redimensionando imagen ${filename} para procesamiento Mistral (${bufferSizeMB.toFixed(2)} MB)`);
+        workingBuffer = await sharp(imageBuffer)
+          .resize(1500, 1500, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 90 })
+          .toBuffer();
+      } else {
+        workingBuffer = Buffer.from(imageBuffer);
       }
-    }
-
-    // Paso 2: Rotación si está habilitada
-    if (config.useRotation && retryAttempt < rotations.length) {
-      const rotation = rotations[retryAttempt];
-      if (rotation !== 0) {
-        console.log(`Aplicando rotación de ${rotation}° para ${filename}...`);
-        workingBuffer = await rotateImage(workingBuffer, rotation);
+      
+      // Aplicar recorte de papel si es necesario (solo en último intento)
+      let cropRegion = null;
+      if (config.crop) {
+        console.log(`Detectando área del papel para ${filename}...`);
+        const cropResult = await detectAndCropPaper(workingBuffer);
+        workingBuffer = cropResult.croppedImage;
+        cropRegion = cropResult.cropRegion;
       }
-    }
-
-    // Paso 3: Preprocesar la imagen con la configuración específica
-    let imageProcessor = sharp(workingBuffer)
-      .resize(config.resize);
-
-    if (config.greyscale) imageProcessor = imageProcessor.greyscale();
-    if (config.normalize) imageProcessor = imageProcessor.normalize();
-    if (config.sharpen) imageProcessor = imageProcessor.sharpen(config.sharpen);
-    if (config.contrast) imageProcessor = imageProcessor.modulate({ brightness: config.brightness || 1, contrast: config.contrast });
-    if (config.threshold) imageProcessor = imageProcessor.threshold(config.threshold);
-
-    const processedImage = await imageProcessor
-      .jpeg({ quality: config.quality })
-      .toBuffer();
-
-    // Convertir buffer procesado a base64
-    const base64Image = processedImage.toString('base64');
-
-    // Prompts progresivamente más específicos y adaptados
-    const prompts = [
-      // Intento 1: Búsqueda estándar
-      "Examina cuidadosamente esta imagen y busca un número de checklist. " +
-      "Busca texto como: 'Checklist N°', 'Checklist Nº', 'Checklist N', 'Checklist No', " +
-      "'Check List N°', 'CHECKLIST N°', o cualquier variación similar. " +
-      "El número debe tener entre 5 y 7 dígitos. " +
-      "Examina toda la imagen, incluyendo esquinas, bordes y áreas con texto pequeño. " +
-      "Si encuentras el número, responde ÚNICAMENTE con esos dígitos. " +
-      "Si no encuentras ningún número de checklist, responde exactamente 'NO_ENCONTRADO'.",
       
-      // Intento 2: Con detección de papel
-      "Esta imagen muestra un documento o papel. Busca un número de checklist de 5-7 dígitos. " +
-      "El número puede aparecer cerca de palabras como: 'Checklist', 'Check', 'List', 'N°', 'Nº', 'No', 'Número'. " +
-      "Busca en TODA la superficie del papel: encabezados, pies de página, márgenes, esquinas. " +
-      "El número puede estar en diferentes formatos: 123456, 12-34-56, 12.34.56, etc. " +
-      "Responde SOLO con los dígitos del número encontrado, sin espacios ni símbolos. " +
-      "Si no encuentras nada, responde 'NO_ENCONTRADO'.",
+      // Aplicar mejoras de imagen si es necesario
+      if (config.enhance) {
+        console.log(`Aplicando mejoras de imagen para ${filename}...`);
+        processedImage = await sharp(workingBuffer)
+          .greyscale()
+          .normalize()
+          .sharpen()
+          .modulate({ contrast: 1.2 })
+          .toBuffer();
+        workingBuffer = processedImage;
+        processedImage = null;
+      }
       
-      // Intento 3: Alta resolución
-      "Analiza esta imagen de alta resolución buscando un número de checklist. " +
-      "Busca CUALQUIER secuencia de 5, 6 o 7 dígitos consecutivos. " +
-      "Examina texto pequeño, códigos, sellos, firmas, watermarks. " +
-      "El número puede estar en cualquier orientación o tamaño. " +
-      "Lista el primer número de 5-7 dígitos que encuentres. " +
-      "Si no encuentras ninguno, responde 'NO_ENCONTRADO'.",
+      // Convertir a base64
+      base64Image = workingBuffer.toString('base64');
       
-      // Intento 4: Texto difícil con umbralización
-      "Esta imagen ha sido procesada para mejorar la legibilidad del texto. " +
-      "Busca números de checklist que pueden estar borrosos, desenfocados o con poco contraste. " +
-      "Busca secuencias de 5-7 dígitos cerca de palabras relacionadas con 'checklist'. " +
-      "El texto puede aparecer distorsionado pero los números deben ser reconocibles. " +
-      "Responde con el número encontrado o 'NO_ENCONTRADO'.",
+      // Preparar prompt optimizado
+      const prompt = config.resolution === 'high' 
+        ? `Analiza esta imagen de checklist. Busca "Checklist N°", "Checklist Nº", "CHECKLIST N°" seguido de un número de 5-7 dígitos. Responde SOLO el número o "NO_ENCONTRADO".`
+        : `Busca en esta imagen el texto "Checklist N°" seguido de un número de 5-7 dígitos. Responde SOLO el número o "NO_ENCONTRADO".`;
       
-      // Intento 5: Con rotación
-      "Esta imagen puede estar rotada. Busca un número de checklist considerando que el texto " +
-      "puede estar en diferentes orientaciones. Busca números de 5-7 dígitos que aparezcan " +
-      "cerca de texto que pueda decir 'Checklist', 'Check List', o variaciones similares. " +
-      "El documento puede estar girado, pero los números deben ser legibles. " +
-      "Responde solo con los dígitos encontrados o 'NO_ENCONTRADO'.",
+      // Llamar a Mistral con timeout reducido
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Timeout de Mistral')), 15000) // 15 segundos
+      );
       
-      // Intento 6: Búsqueda extrema
-      "ANÁLISIS EXHAUSTIVO: Examina cada píxel de esta imagen buscando CUALQUIER número de 5-7 dígitos. " +
-      "Ignora completamente el contexto. Solo busca secuencias numéricas. " +
-      "Pueden estar en: códigos de barras, sellos, firmas, fondos, bordes, esquinas, " +
-      "texto pequeño, borroso, rotado, parcialmente oculto o cortado. " +
-      "Lista TODOS los números de 5-7 dígitos que encuentres, separados por comas. " +
-      "Si no encuentras absolutamente ninguno, responde 'NO_ENCONTRADO'."
-    ];
-
-    const response = await mistral.chat.complete({
-      model: "pixtral-12b-latest",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: prompts[retryAttempt] || prompts[0]
-            },
-            {
-              type: "image_url",
-              imageUrl: `data:image/jpeg;base64,${base64Image}`
-            }
-          ]
+      const mistralPromise = mistral.chat.complete({
+        model: 'pixtral-12b-2409',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: prompt
+              },
+              {
+                type: 'image_url',
+                image_url: `data:image/jpeg;base64,${base64Image}`
+              }
+            ]
+          }
+        ],
+        max_tokens: 30 // Reducido para respuestas más rápidas
+      });
+      
+      const chatResponse = await Promise.race([mistralPromise, timeoutPromise]);
+      
+      const extractedText = chatResponse.choices[0]?.message?.content?.trim();
+      console.log(`Respuesta de Mistral (intento ${attempt + 1}) para ${filename}: ${extractedText}`);
+      
+      if (extractedText && extractedText !== 'NO_ENCONTRADO') {
+        const checklistNumber = extractChecklistNumber(extractedText);
+        if (checklistNumber) {
+          console.log(`Mistral extrajo número de checklist: ${checklistNumber} para ${filename} (intento ${attempt + 1})`);
+          return {
+            filename,
+            checklistNumber,
+            extractedText,
+            confidence: 95 - (attempt * 15), // Reducir confianza con más intentos
+            processingMethod: 'mistral_ocr',
+            retryAttempt: attempt + 1,
+            processingConfig: config.name,
+            wasCropped: config.crop,
+            rotation: config.rotate,
+            cropRegion,
+            success: true
+          };
         }
-      ],
-      max_tokens: 150
-    });
-
-    const extractedText = response.choices?.[0]?.message?.content?.trim();
-    console.log(`Respuesta de Mistral (intento ${retryAttempt + 1}) para ${filename}: ${extractedText}`);
-
-    if (extractedText && extractedText !== "NO_ENCONTRADO") {
-      // Buscar números en la respuesta de manera más flexible
-      const numberMatches = extractedText.match(/\d{5,7}/g);
-      
-      if (numberMatches && numberMatches.length > 0) {
-        // Tomar el primer número válido encontrado
-        const cleanNumber = numberMatches[0];
-        const fixedNumber = fix(cleanNumber);
-        console.log(`Mistral extrajo número de checklist: ${fixedNumber} para ${filename} (intento ${retryAttempt + 1})`);
-        return {
-          filename,
-          checklistNumber: fixedNumber,
-          extractedText,
-          confidence: 90 - (retryAttempt * 3), // Reducir confianza gradualmente
-          processingMethod: `mistral_ocr_attempt_${retryAttempt + 1}`,
-          wasCropped: cropInfo.wasCropped,
-          cropRegion: cropInfo.cropRegion,
-          rotation: config.useRotation && retryAttempt < rotations.length ? rotations[retryAttempt] : 0,
-          processingConfig: config.name,
-          success: true,
-          retryAttempt: retryAttempt + 1
-        };
       }
       
-      // Si no hay números de 5-7 dígitos, intentar extraer cualquier número y limpiarlo
-      const allNumbers = extractedText.replace(/[^0-9]/g, "");
-      if (allNumbers.length >= 5 && allNumbers.length <= 7) {
-        const fixedNumber = fix(allNumbers);
-        console.log(`Mistral extrajo número de checklist (limpiado): ${fixedNumber} para ${filename} (intento ${retryAttempt + 1})`);
+      console.log(`Intento ${attempt + 1} falló para ${filename}, probando con configuración diferente...`);
+      
+    } catch (error) {
+      console.error(`Error en intento ${attempt + 1} para ${filename}:`, error.message);
+      
+      // Si es el último intento, devolver error
+      if (attempt === maxRetries - 1) {
         return {
           filename,
-          checklistNumber: fixedNumber,
-          extractedText,
-          confidence: 85 - (retryAttempt * 3),
-          processingMethod: `mistral_ocr_attempt_${retryAttempt + 1}`,
-          wasCropped: cropInfo.wasCropped,
-          cropRegion: cropInfo.cropRegion,
-          rotation: config.useRotation && retryAttempt < rotations.length ? rotations[retryAttempt] : 0,
-          processingConfig: config.name,
-          success: true,
-          retryAttempt: retryAttempt + 1
+          checklistNumber: null,
+          error: `Error después de ${maxRetries} intentos: ${error.message}`,
+          extractedText: '',
+          wasCropped: false,
+          cropRegion: null,
+          success: false
         };
       }
-    }
-
-    // Si este intento falló y aún hay reintentos disponibles
-    if (retryAttempt < maxRetries - 1) {
-      console.log(`Intento ${retryAttempt + 1} falló para ${filename}, probando con configuración diferente...`);
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Pausa de 1 segundo
-      return await processImageWithMistral(imageBuffer, filename, retryAttempt + 1);
-    }
-
-    console.log(`Todos los intentos fallaron para ${filename}`);
-    return null;
-  } catch (error) {
-    console.error(`Error en intento ${retryAttempt + 1} procesando ${filename} con Mistral:`, error.message);
-    
-    // Si hay error y aún quedan reintentos
-    if (retryAttempt < maxRetries - 1) {
-      console.log(`Error en intento ${retryAttempt + 1}, reintentando...`);
-      await new Promise(resolve => setTimeout(resolve, 2000)); // Pausa más larga en caso de error
-      return await processImageWithMistral(imageBuffer, filename, retryAttempt + 1);
+    } finally {
+      // Liberar memoria después de cada intento
+      workingBuffer = null;
+      processedImage = null;
+      base64Image = null;
+      
+      if (global.gc) {
+        global.gc();
+      }
     }
     
-    return null;
+    // Pausa más corta entre intentos
+    if (attempt < maxRetries - 1) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
   }
+  
+  // Si todos los intentos fallan
+  console.log(`Todos los intentos fallaron para ${filename}`);
+  return {
+    filename,
+    checklistNumber: null,
+    error: `No se pudo extraer número de checklist después de ${maxRetries} intentos con diferentes configuraciones.`,
+    extractedText: '',
+    wasCropped: false,
+    cropRegion: null,
+    success: false
+  };
 }
 
 // Configurar Mistral
